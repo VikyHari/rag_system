@@ -1,0 +1,87 @@
+================================================================================
+  RAG System — Fixed Extraction Logic & Chunking Theory
+================================================================================
+
+1. TEXT EXTRACTION PIPELINE
+--------------------------------------------------------------------------------
+The system extracts raw text from two sources:
+
+  a) PDF Upload
+     - Primary extractor: pdfplumber (handles tables, columns, structured layouts)
+     - Fallback extractor: PyPDF2 (basic text extraction when pdfplumber fails)
+     - Both extractors iterate page-by-page and concatenate with double newlines.
+
+  b) AWS S3 Data Connection
+     - Supported formats: .pdf, .txt, .csv, .json, .md
+     - PDFs go through the same extraction pipeline above.
+     - Text-based formats are read directly with UTF-8 encoding.
+
+2. TEXT CLEANING
+--------------------------------------------------------------------------------
+After extraction, the raw text is normalised:
+  - Null bytes (\x00) are removed.
+  - Each line is stripped of leading/trailing whitespace.
+  - Consecutive blank lines are collapsed to a single blank line.
+  - The final result is trimmed.
+
+3. CHUNKING THEORY
+--------------------------------------------------------------------------------
+The cleaned text is split into overlapping fixed-size chunks before embedding.
+
+  Parameters:
+    CHUNK_SIZE    = 500 characters
+    CHUNK_OVERLAP = 100 characters
+    STEP          = CHUNK_SIZE - CHUNK_OVERLAP = 400 characters
+
+  Algorithm:
+    start = 0
+    while start < len(text):
+        end   = min(start + CHUNK_SIZE, len(text))
+        chunk = text[start : end]
+        store chunk with metadata {start_char, end_char, chunk_index}
+        start += STEP
+
+  Resulting windows (character ranges):
+    Chunk 0:  [   0 ..  499 ]
+    Chunk 1:  [ 400 ..  899 ]
+    Chunk 2:  [ 800 .. 1299 ]
+    Chunk 3:  [1200 .. 1699 ]
+    ...
+
+  Why overlapping chunks?
+    - Ensures no sentence or concept that spans a chunk boundary is lost.
+    - The 100-character overlap preserves context at the edges.
+    - During retrieval, if two overlapping chunks both score highly, the system
+      can merge them to reconstruct the full surrounding passage.
+
+4. EMBEDDING
+--------------------------------------------------------------------------------
+Each chunk is embedded independently using OpenAI text-embedding-3-small,
+producing a 1536-dimensional float vector. Batch embedding is used when
+processing an entire document to minimise API round-trips.
+
+5. VECTOR STORAGE
+--------------------------------------------------------------------------------
+Embedded chunks are stored in Pinecone with the following structure:
+
+  Vector ID  : UUID v4
+  Values     : [float × 1536]
+  Namespace  : "user_{user_id}_upload_{upload_id}"
+  Metadata   :
+    - text        : the chunk's raw text (for display in answers)
+    - start_char  : starting character position in the original document
+    - end_char    : ending character position
+    - chunk_index : sequential chunk number
+    - filename    : original file name (PDF) or S3 key
+
+6. RETRIEVAL & ANSWERING
+--------------------------------------------------------------------------------
+When a user asks a question:
+  1. The question is embedded with the same text-embedding-3-small model.
+  2. A cosine-similarity search runs against the user's namespace.
+  3. Top-k results (default 5) above the score threshold (0.70) are returned.
+  4. The retrieved chunk texts are assembled into a context prompt.
+  5. The context + question are sent to the chosen LLM (ChatGPT / Gemini / Claude).
+  6. The LLM generates an answer grounded in the retrieved context.
+
+================================================================================
